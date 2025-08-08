@@ -1,0 +1,13 @@
+torch>=1.12.0
+mxnet>=1.6.0,<1.7.0
+gluonnlp>=0.9.0,<0.11.0
+sentencepiece>=0.1.96
+onnxruntime>=1.7.0
+transformers>=4.0.0
+numpy>=1.16.0,<1.17.0
+streamlit>=1.28.0
+pandas>=1.5.0
+plotly>=5.15.0
+matplotlib>=3.6.0
+seaborn>=0.12.0
+pycountry>=22.0.0
