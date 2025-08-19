@@ -1,0 +1,7 @@
+# Minimal PoC dependencies
+paddleocr>=2.7.0
+opencv-python>=4.8.0
+pdf2image>=1.17.0
+pillow>=10.2.0
+pytesseract>=0.3.10  # optional baseline
+pandas>=2.2.0

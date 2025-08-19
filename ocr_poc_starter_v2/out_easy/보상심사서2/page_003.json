@@ -1,0 +1,6 @@
+{
+  "engine": "easyocr",
+  "lines": [],
+  "text": "",
+  "error": "Unable to allocate 53.4 MiB for an array with shape (2560, 1824, 3) and data type float32"
+}

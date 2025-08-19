@@ -1,0 +1,3 @@
+﻿file,page_count,section_counts,engine_used,error
+보상심사서1.pdf,0,{},easyocr,Object of type int32 is not JSON serializable
+보상심사서2.pdf,0,{},easyocr,Object of type int32 is not JSON serializable

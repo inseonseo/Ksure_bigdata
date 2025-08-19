@@ -1,0 +1,19 @@
+{
+  "file": "보상심사서2.pdf",
+  "engine_used": "tesseract",
+  "decision": "면책",
+  "amount_candidates": [
+    ", 원",
+    ",\n원"
+  ],
+  "date_1": null,
+  "date_2": null,
+  "date_3": null,
+  "section_counts": {
+    "요약/결재": 3,
+    "보상판정/계약개요": 1,
+    "사고조사/경위": 2,
+    "심사의견": 4,
+    "결재서류": 0
+  }
+}
