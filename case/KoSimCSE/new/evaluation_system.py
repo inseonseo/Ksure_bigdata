@@ -286,15 +286,25 @@ class InsuranceEvaluationSystem:
                 le.fit(train_values)
                 self.label_encoders[feature] = le
                 
-                # 모든 데이터셋에 적용
+                # 모든 데이터셋에 적용 (미지 카테고리는 'Unknown' 코드로 대체)
                 for df_name, df in [('train', self.train_df), ('valid', self.valid_df), ('test', self.test_df)]:
                     values = df[feature].fillna('Unknown').astype(str)
-                    
-                    # 새로운 카테고리는 'Unknown'으로 처리
-                    mask = values.isin(le.classes_)
-                    encoded_values = np.full(len(values), le.transform(['Unknown'])[0])
-                    encoded_values[mask] = le.transform(values[mask])
-                    
+
+                    # LabelEncoder에 'Unknown' 클래스가 없으면 추가 (정렬 보장)
+                    if 'Unknown' not in le.classes_:
+                        le.classes_ = np.sort(np.append(le.classes_, 'Unknown'))
+
+                    # 폴백 코드(Unknown)
+                    unknown_code = le.transform(['Unknown'])[0]
+
+                    # 알려진 값 마스크
+                    known_mask = values.isin(le.classes_)
+
+                    # 전부 Unknown 코드로 채운 후, 알려진 값만 변환해서 덮어씀
+                    encoded_values = np.full(len(values), unknown_code)
+                    if known_mask.any():
+                        encoded_values[known_mask] = le.transform(values[known_mask])
+
                     df[f'{feature}_encoded'] = encoded_values
                     
                 print(f"   - {feature}: {len(le.classes_)}개 카테고리")
@@ -306,14 +316,21 @@ class InsuranceEvaluationSystem:
                 # Train 데이터로 정규화 파라미터 계산
                 train_mean = self.train_df[feature].mean()
                 train_std = self.train_df[feature].std()
-                
+
+                # 분산 0 방어 (정규화 불가 시 0으로 설정)
+                if pd.isna(train_std) or train_std == 0:
+                    for df_name, df in [('train', self.train_df), ('valid', self.valid_df), ('test', self.test_df)]:
+                        df[f'{feature}_normalized'] = 0.0
+                    print(f"   - {feature}: 표준편차 0 → 정규화 생략(0으로 설정)")
+                    continue
+
                 # 모든 데이터셋에 적용
                 for df_name, df in [('train', self.train_df), ('valid', self.valid_df), ('test', self.test_df)]:
                     df[f'{feature}_normalized'] = (df[feature] - train_mean) / train_std
-                
+
                 print(f"   - {feature}: 정규화 완료 (평균: {train_mean:.2f}, 표준편차: {train_std:.2f})")
     
-    def evaluate_similarity_system(self, similarity_system, sample_size=100):
+    def evaluate_similarity_system(self, similarity_system, sample_size=300):
         """
         유사도 시스템 성능 평가 (다중 타겟 평가)
         
@@ -352,19 +369,34 @@ class InsuranceEvaluationSystem:
                 if similarities:
                     # 상위 5개 유사사례 분석
                     top_5 = similarities[:5]
-                    
-                    # 1. 판정구분 예측
-                    judgment_decisions = [case[3]['판정구분'] for case in top_5]
-                    pred_judgment = Counter(judgment_decisions).most_common(1)[0][0]
-                    judgment_confidence = judgment_decisions.count(pred_judgment) / len(judgment_decisions)
-                    
-                    # 2. 판정사유 예측
-                    reason_decisions = [case[3]['판정사유'] for case in top_5]
-                    pred_reason = Counter(reason_decisions).most_common(1)[0][0]
-                    reason_confidence = reason_decisions.count(pred_reason) / len(reason_decisions)
-                    
+
+                    # 가중 다수결: 유사도 점수를 가중치로 합산하여 최다 가중 클래스를 예측
+                    def weighted_vote(label_list, weights):
+                        scores = {}
+                        for lbl, w in zip(label_list, weights):
+                            scores[lbl] = scores.get(lbl, 0.0) + float(w)
+                        # 최대 가중치 라벨 반환
+                        return max(scores.items(), key=lambda x: x[1])[0], scores
+
+                    top_scores = [case[0] for case in top_5]
+                    judgment_labels = [case[3]['판정구분'] for case in top_5]
+                    reason_labels = [case[3]['판정사유'] for case in top_5]
+
+                    pred_judgment, judgment_score_map = weighted_vote(judgment_labels, top_scores)
+                    pred_reason, reason_score_map = weighted_vote(reason_labels, top_scores)
+
+                    # 면책 오버라이드: 최상위 1건이 면책이고 종합유사도 임계치 이상이면 면책으로 고정
+                    top1_score, _, _, top1_case = top_5[0]
+                    if top1_case['판정구분'] == '면책' and top1_score >= 0.65:
+                        pred_judgment = '면책'
+
+                    # 신뢰도: 가중 합 중 예측 라벨 비율
+                    sum_w = sum(top_scores) if top_scores else 1.0
+                    judgment_confidence = (judgment_score_map.get(pred_judgment, 0.0) / sum_w) if sum_w else 0.0
+                    reason_confidence = (reason_score_map.get(pred_reason, 0.0) / sum_w) if sum_w else 0.0
+
                     # 평균 유사도
-                    avg_similarity = np.mean([case[0] for case in top_5])
+                    avg_similarity = np.mean(top_scores) if top_scores else 0.0
                     
                     # 결과 저장
                     results['judgment']['predictions'].append(pred_judgment)
@@ -393,6 +425,7 @@ class InsuranceEvaluationSystem:
     def _calculate_multi_target_metrics(self, results):
         """다중 타겟 성능 지표 계산"""
         from sklearn.metrics import classification_report, confusion_matrix, balanced_accuracy_score, f1_score
+        from sklearn.metrics import precision_recall_fscore_support
         
         final_results = {}
         
@@ -444,6 +477,21 @@ class InsuranceEvaluationSystem:
                 'min': np.min(confidence_scores),
                 'max': np.max(confidence_scores)
             }
+
+            # 면책 중심 바이너리 지표 (판정구분일 때만 계산)
+            exemption_metrics = None
+            if target_type == 'judgment' and predictions and actuals:
+                y_true = [1 if a == '면책' else 0 for a in actuals]
+                y_pred = [1 if p == '면책' else 0 for p in predictions]
+                prec, rec, f1_bin, support_pos = precision_recall_fscore_support(
+                    y_true, y_pred, average='binary', zero_division=0
+                )
+                exemption_metrics = {
+                    'precision': float(prec),
+                    'recall': float(rec),
+                    'f1': float(f1_bin),
+                    'positive_support': int(sum(y_true))
+                }
             
             final_results[target_type] = {
                 'accuracy': accuracy,
@@ -459,6 +507,7 @@ class InsuranceEvaluationSystem:
                 'class_performance': class_performance,
                 'similarity_stats': similarity_stats,
                 'confidence_stats': confidence_stats,
+                'exemption_metrics': exemption_metrics,
                 'sample_size': len(predictions)
             }
         
@@ -479,6 +528,9 @@ class InsuranceEvaluationSystem:
         print(f"   - 평가 샘플 수: {judgment['sample_size']}개")
         print(f"   - 평균 유사도: {judgment['similarity_stats']['mean']:.3f} ± {judgment['similarity_stats']['std']:.3f}")
         print(f"   - 평균 신뢰도: {judgment['confidence_stats']['mean']:.3f} ± {judgment['confidence_stats']['std']:.3f}")
+        if judgment.get('exemption_metrics'):
+            em = judgment['exemption_metrics']
+            print(f"   - 면책 탐지(이진) Precision: {em['precision']:.3f}, Recall: {em['recall']:.3f}, F1: {em['f1']:.3f} (면책 수: {em['positive_support']})")
         
         # 판정구분 클래스별 성능
         print(f"\n📊 판정구분 클래스별 성능:")

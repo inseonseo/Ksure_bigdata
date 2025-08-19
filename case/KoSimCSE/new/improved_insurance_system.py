@@ -1,6 +1,28 @@
+import numpy as np
+# NumPy 2.0 compatibility aliases for removed dtypes
+if not hasattr(np, "unicode_"):
+    np.unicode_ = np.str_
+if not hasattr(np, "string_"):
+    np.string_ = np.bytes_
+try:
+    np.bool
+except AttributeError:
+    np.bool = np.bool_
+try:
+    np.object
+except AttributeError:
+    np.object = np.object_
+try:
+    np.int
+except AttributeError:
+    np.int = int
+try:
+    np.float
+except AttributeError:
+    np.float = float
+
 import streamlit as st
 import pandas as pd
-import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -11,7 +33,6 @@ from sklearn.metrics import classification_report, confusion_matrix, accuracy_sc
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import torch
-from transformers import AutoModel, AutoTokenizer
 from collections import Counter
 from scipy import stats
 import pickle
@@ -328,11 +349,16 @@ class ImprovedInsuranceSystem:
         # 캐시 관리
         self.embeddings_cache = {}
         self.similarity_cache = {}
+        
+        # 런타임 가중치 오버라이드(세션 중 일시 적용)
+        self.runtime_weight_overrides = None
     
     @st.cache_resource
     def load_kosimcse_model(_self):
         """KoSimCSE 모델 로드"""
         try:
+            # Lazy import to avoid hard dependency at module import time
+            from transformers import AutoModel, AutoTokenizer
             model_name = "BM-K/KoSimCSE-roberta-multitask"
             tokenizer = AutoTokenizer.from_pretrained(model_name)
             model = AutoModel.from_pretrained(model_name)
@@ -382,6 +408,8 @@ class ImprovedInsuranceSystem:
         embeddings = []
         
         try:
+            # Lazy import torch to avoid ImportError if not installed
+            import torch
             for i in range(0, len(valid_texts), batch_size):
                 batch_texts = valid_texts[i:i + batch_size]
                 
@@ -450,8 +478,32 @@ class ImprovedInsuranceSystem:
     def calculate_similarity_scores(self, query_case, candidates_df):
         """개선된 유사도 점수 계산"""
         
+        # 0) 데이터 누출 방지: 동일 케이스/중복 텍스트 후보 제거
+        safe_candidates = candidates_df.copy()
+        try:
+            # 동일 사고번호/보상파일번호 배제
+            for key in ['사고번호', '보상파일번호']:
+                if key in safe_candidates.columns and key in query_case:
+                    safe_candidates = safe_candidates[safe_candidates[key] != query_case.get(key)]
+            # 동일 텍스트(전처리 후) 완전 일치 + 주요 메타 동일시 배제
+            q_text_norm = self.preprocess_text(query_case.get('사고설명', ''))
+            if q_text_norm:
+                def _norm_text(x):
+                    return self.preprocess_text(x)
+                txt_eq = safe_candidates['사고설명'].apply(_norm_text) == q_text_norm
+                meta_eq = True
+                if '수입국' in safe_candidates.columns and '수입국' in query_case:
+                    meta_eq = meta_eq & (safe_candidates['수입국'] == query_case.get('수입국'))
+                if '보험종목' in safe_candidates.columns and '보험종목' in query_case:
+                    meta_eq = meta_eq & (safe_candidates['보험종목'] == query_case.get('보험종목'))
+                dup_mask = txt_eq & meta_eq
+                if dup_mask.any():
+                    safe_candidates = safe_candidates[~dup_mask]
+        except Exception:
+            pass
+
         # 스마트 필터링으로 후보 수 제한
-        filtered_candidates = self.smart_candidate_filtering(query_case, candidates_df)
+        filtered_candidates = self.smart_candidate_filtering(query_case, safe_candidates)
         
         # 면책 사례와 비면책 사례 분리
         exemption_candidates = filtered_candidates[filtered_candidates['판정구분'] == '면책']
@@ -503,7 +555,8 @@ class ImprovedInsuranceSystem:
         # 통합 유사도 계산
         for i, (idx, candidate) in enumerate(filtered_candidates.iterrows()):
             score = 0.0
-            weights = self.optimal_weights
+            # 런타임 오버라이드가 있으면 우선 적용
+            weights = self.runtime_weight_overrides if self.runtime_weight_overrides else self.optimal_weights
             
             # 1. 텍스트 유사도
             if i < len(text_similarities):
@@ -1033,23 +1086,42 @@ def create_similarity_search_interface(system, df):
             help="보험종목의 중요도"
         )
         
-        # 가중치 합계 확인
+        # 선택 비활성 체크박스: 특정 피처 영향 제외
+        st.write("**피처 사용 여부(선택 안함 가능):**")
+        use_text = st.checkbox("텍스트 사용", value=True)
+        use_accident = st.checkbox("사고유형 사용", value=True)
+        use_country = st.checkbox("국가 사용", value=True)
+        use_amount = st.checkbox("금액 사용", value=True)
+        use_insurance = st.checkbox("보험종목 사용", value=True)
+
+        # 사용 안함이면 해당 가중치를 0으로 간주
+        text_weight = text_weight if use_text else 0.0
+        accident_weight = accident_weight if use_accident else 0.0
+        country_weight = country_weight if use_country else 0.0
+        amount_weight = amount_weight if use_amount else 0.0
+        insurance_weight = insurance_weight if use_insurance else 0.0
+
+        # 가중치 합계 확인(정규화는 하지 않음: 절대 가중으로 처리)
         total_weight = text_weight + accident_weight + country_weight + amount_weight + insurance_weight
-        if total_weight != 1.0:
-            st.warning(f"⚠️ 가중치 합계: {total_weight:.2f} (권장: 1.00)")
-        else:
-            st.success(f"✅ 가중치 합계: {total_weight:.2f}")
+        st.info(f"가중치 합계: {total_weight:.2f} (절대 가중)")
         
         # 가중치 적용 버튼
         if st.button("가중치 적용"):
-            system.optimal_weights.update({
+            # 런타임 오버라이드 반영(세션 동안만 적용)
+            system.runtime_weight_overrides = {
                 'text_similarity': text_weight,
                 'accident_type': accident_weight,
                 'country_similarity': country_weight,
                 'amount_similarity': amount_weight,
-                'insurance_type': insurance_weight
-            })
-            st.success("가중치가 적용되었습니다!")
+                'insurance_type': insurance_weight,
+                # 나머지 항목은 원래 최적값 유지(오버라이드에서 제공 안 함)
+                'product_category': system.optimal_weights.get('product_category', 0.0),
+                'coverage_rate': system.optimal_weights.get('coverage_rate', 0.0),
+                'payment_method': system.optimal_weights.get('payment_method', 0.0),
+                'payment_terms': system.optimal_weights.get('payment_terms', 0.0),
+                'future_outlook': system.optimal_weights.get('future_outlook', 0.0),
+            }
+            st.success("가중치(사용 안함 포함)가 적용되었습니다!")
     
     # 검색 폼
     with st.form("improved_search_form"):
@@ -1258,7 +1330,9 @@ def create_similarity_search_interface(system, df):
             
             # 개선된 유사도 계산
             similarities = system.calculate_similarity_scores(case_data, search_df)
-            top_similar = similarities[:max_results]
+            # 상위 5건만, 유사도 0.30 미만 제외
+            min_score = 0.30
+            top_similar = [r for r in similarities if r[0] >= min_score][:5]
             
             search_time = time.time() - start_time
         
@@ -1426,10 +1500,10 @@ def create_similarity_search_interface(system, df):
             for i, (total_score, text_sim, country_sim, similar_case) in enumerate(top_similar):
                 # 면책 사례는 특별 표시
                 if similar_case['판정구분'] == '면책':
-                    expander_title = f"🛡️ #{i+1} 종합유사도 {total_score:.3f} - ⚠️ **{similar_case['판정구분']}** ({similar_case['사고유형명']}) ⚠️"
+                    expander_title = f"🛡️ #{i+1} 종합유사도 {total_score*100:.1f}% - ⚠️ **{similar_case['판정구분']}** ({similar_case['사고유형명']}) ⚠️"
                     expanded = True  # 면책은 기본 펼쳐짐
                 else:
-                    expander_title = f"#{i+1} 종합유사도 {total_score:.3f} - {similar_case['판정구분']} ({similar_case['사고유형명']})"
+                    expander_title = f"#{i+1} 종합유사도 {total_score*100:.1f}% - {similar_case['판정구분']} ({similar_case['사고유형명']})"
                     expanded = False
                 
                 with st.expander(expander_title, expanded=expanded):
@@ -1468,11 +1542,11 @@ def create_similarity_search_interface(system, df):
                     
                     col1, col2, col3 = st.columns(3)
                     with col1:
-                        st.metric("텍스트 유사도", f"{text_sim:.1%}")
+                        st.metric("텍스트 유사도", f"{text_sim*100:.1f}%")
                     with col2:
-                        st.metric("국가 유사도", f"{country_sim:.1%}")
+                        st.metric("국가 유사도", f"{country_sim*100:.1f}%")
                     with col3:
-                        st.metric("종합 유사도", f"{total_score:.1%}")
+                        st.metric("종합 유사도", f"{total_score*100:.1f}%")
                     
                     # 진행바
                     total_pct = min(total_score * 100, 100)
@@ -1481,6 +1555,13 @@ def create_similarity_search_interface(system, df):
                     if pd.notna(similar_case['사고설명']) and len(str(similar_case['사고설명'])) > 10:
                         st.write("**📝 사고설명**")
                         st.markdown(f"> {similar_case['사고설명']}")
+
+                    # 전문가용 핵심 변수 요약
+                    st.write("**🔎 핵심 변수**")
+                    st.write(f"- 상품분류그룹명: {similar_case.get('상품분류그룹명','-')}")
+                    st.write(f"- 결제방법/조건: {similar_case.get('결제방법','-')} / {similar_case.get('결제조건','-')}")
+                    st.write(f"- 부보율: {similar_case.get('부보율','-')}")
+                    st.write(f"- 향후전망: {similar_case.get('향후결제전망','-')}")
         else:
             st.warning("조건에 맞는 유사사례를 찾을 수 없습니다.")
 
@@ -1567,39 +1648,42 @@ def create_exemption_reason_tab(df):
         
         if len(filtered_cases) > 0:
             st.success(f"✅ **{selected_reason}** 면책사유로 총 **{len(filtered_cases)}건**의 사례를 찾았습니다.")
-            
-            # 필터링 옵션
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                # 수입국 필터
-                countries = ['전체'] + sorted(filtered_cases['수입국'].unique().tolist())
-                selected_country = st.selectbox("수입국 필터:", countries)
-            
-            with col2:
-                # 보험종목 필터
-                insurance_types = ['전체'] + sorted(filtered_cases['보험종목'].unique().tolist())
-                selected_insurance = st.selectbox("보험종목 필터:", insurance_types)
-            
-            with col3:
-                # 사고유형 필터
-                accident_types = ['전체'] + sorted(filtered_cases['사고유형명'].unique().tolist())
-                selected_accident = st.selectbox("사고유형 필터:", accident_types)
-            
-            # 필터 적용
+
+            # 기본: 면책사유만으로 필터링된 결과를 사용
             display_cases = filtered_cases.copy()
-            
-            if selected_country != '전체':
-                display_cases = display_cases[display_cases['수입국'] == selected_country]
-                st.info(f"🔍 수입국 필터: {selected_country} ({len(display_cases)}건)")
-            
-            if selected_insurance != '전체':
-                display_cases = display_cases[display_cases['보험종목'] == selected_insurance]
-                st.info(f"🔍 보험종목 필터: {selected_insurance} ({len(display_cases)}건)")
-            
-            if selected_accident != '전체':
-                display_cases = display_cases[display_cases['사고유형명'] == selected_accident]
-                st.info(f"🔍 사고유형 필터: {selected_accident} ({len(display_cases)}건)")
+
+            # 선택: 고급 필터 (기본 비활성화)
+            with st.expander("⚙️ 고급 필터 (선택)", expanded=False):
+                use_advanced_filters = st.checkbox("고급 필터 사용", value=False)
+                if use_advanced_filters:
+                    col1, col2, col3 = st.columns(3)
+
+                    with col1:
+                        countries = ['전체'] + sorted(display_cases['수입국'].dropna().unique().tolist())
+                        selected_country = st.selectbox("수입국 필터:", countries)
+                    with col2:
+                        insurance_types = ['전체'] + sorted(display_cases['보험종목'].dropna().unique().tolist())
+                        selected_insurance = st.selectbox("보험종목 필터:", insurance_types)
+                    with col3:
+                        accident_types = ['전체'] + sorted(display_cases['사고유형명'].dropna().unique().tolist())
+                        selected_accident = st.selectbox("사고유형 필터:", accident_types)
+
+                    if selected_country != '전체':
+                        display_cases = display_cases[display_cases['수입국'] == selected_country]
+                        st.info(f"🔍 수입국 필터: {selected_country} ({len(display_cases)}건)")
+                    if selected_insurance != '전체':
+                        display_cases = display_cases[display_cases['보험종목'] == selected_insurance]
+                        st.info(f"🔍 보험종목 필터: {selected_insurance} ({len(display_cases)}건)")
+                    if selected_accident != '전체':
+                        display_cases = display_cases[display_cases['사고유형명'] == selected_accident]
+                        st.info(f"🔍 사고유형 필터: {selected_accident} ({len(display_cases)}건)")
+
+            # 키워드 검색(사고설명 내 포함 검색)
+            keyword = st.text_input("키워드 검색(사고설명):", value="", help="사고설명에 포함되는 키워드로 간단 검색")
+            if keyword:
+                mask = display_cases['사고설명'].astype(str).str.contains(keyword, case=False, na=False)
+                display_cases = display_cases[mask]
+                st.info(f"🔍 키워드 '{keyword}' 결과: {len(display_cases)}건")
             
             if len(display_cases) > 0:
                 # 정렬 옵션
@@ -1699,15 +1783,15 @@ def create_exemption_reason_tab(df):
                 st.markdown("---")
                 st.subheader("🔍 유사도 검색 기능")
                 
-                # 유사도 검색 방식 선택
+                # 유사도 검색 방식 선택(기본: 면책사유만 필터된 풀에서 검색)
                 search_method = st.radio(
                     "검색 방식을 선택하세요:",
                     [
-                        "방식 A: 해당 면책사유 사례들 중에서 유사도 검색",
+                        "방식 A: 해당 면책사유 사례들(현재 표시된 목록)에서 유사도 검색",
                         "방식 B: 전체 데이터에서 해당 면책사유와 유사한 사례 검색", 
                         "방식 C: 복합 조건으로 유사도 검색"
                     ],
-                    help="각 방식의 차이점을 확인해보세요"
+                    help="A 권장: 과도한 선필터로 0건 방지"
                 )
                 
                 # 검색어 입력
@@ -1754,9 +1838,9 @@ def create_exemption_reason_tab(df):
                         
                         # 검색 방식에 따른 후보 데이터 선택
                         if "방식 A" in search_method:
-                            # 해당 면책사유 사례들만 대상
+                            # 현재 표시 목록(면책사유 + 선택적 고급필터 + 키워드)에서 검색
                             candidates_df = display_cases.copy()
-                            st.info(f"🔍 방식 A: '{selected_reason}' 면책사유 사례 {len(candidates_df)}건 중에서 검색")
+                            st.info(f"🔍 방식 A: 현재 표시 {len(candidates_df)}건에서 검색")
                             
                         elif "방식 B" in search_method:
                             # 전체 데이터에서 해당 면책사유와 유사한 사례 검색
@@ -1802,17 +1886,21 @@ def create_exemption_reason_tab(df):
                         with st.spinner("유사도 계산 중..."):
                             try:
                                 similarities = system.calculate_similarity_scores(query_case, candidates_df)
-                                
-                                if similarities:
+
+                                # 상위 5건만, 0.30 미만 제외
+                                min_score = 0.30
+                                top_items = [r for r in similarities if r[0] >= min_score][:5] if similarities else []
+
+                                if top_items:
                                     # 결과 표시
-                                    st.success(f"✅ 유사도 검색 완료! 상위 {min(10, len(similarities))}개 결과")
-                                    
+                                    st.success(f"✅ 유사도 검색 완료! 상위 {len(top_items)}개 결과 (임계치 {min_score:.2f} 적용)")
+
                                     # 결과 테이블 생성
                                     results_data = []
-                                    for i, (score, text_sim, country_sim, case) in enumerate(similarities[:10], 1):
+                                    for i, (score, text_sim, country_sim, case) in enumerate(top_items, 1):
                                         results_data.append({
                                             '순위': i,
-                                            '유사도': f"{score:.3f}",
+                                            '유사도(%)': f"{score*100:.1f}%",
                                             '판정구분': case['판정구분'],
                                             '판정사유': case['판정사유'],
                                             '수입국': case['수입국'],
@@ -1836,22 +1924,22 @@ def create_exemption_reason_tab(df):
                                     col1, col2, col3 = st.columns(3)
                                     
                                     with col1:
-                                        exemption_count = sum(1 for _, _, _, case in similarities if case['판정구분'] == '면책')
+                                        exemption_count = sum(1 for _, _, _, case in top_items if case['판정구분'] == '면책')
                                         st.metric("면책 사례", exemption_count)
                                     
                                     with col2:
-                                        avg_similarity = sum(score for score, _, _, _ in similarities) / len(similarities)
-                                        st.metric("평균 유사도", f"{avg_similarity:.3f}")
+                                        avg_similarity = sum(score for score, _, _, _ in top_items) / len(top_items)
+                                        st.metric("평균 유사도", f"{avg_similarity*100:.1f}%")
                                     
                                     with col3:
-                                        max_similarity = max(score for score, _, _, _ in similarities)
-                                        st.metric("최고 유사도", f"{max_similarity:.3f}")
+                                        max_similarity = max(score for score, _, _, _ in top_items)
+                                        st.metric("최고 유사도", f"{max_similarity*100:.1f}%")
                                     
                                     # 검색 방식별 특징 설명
                                     st.info(f"""
                                     **🔍 {search_method}**
                                     - 검색 대상: {len(candidates_df)}건
-                                    - 검색 결과: {len(similarities)}건
+                                    - 검색 결과: {len(top_items)}건
                                     - 주요 특징: {'해당 면책사유 사례들 중에서 유사도 기반 정렬' if '방식 A' in search_method else '전체 데이터에서 면책사유 관련성 고려' if '방식 B' in search_method else '복합 조건 + 유사도 검색'}
                                     """)
                                     

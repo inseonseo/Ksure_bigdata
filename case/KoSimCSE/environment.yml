@@ -1,0 +1,22 @@
+name: kosimcse
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy=1.26
+  - pandas=2.2
+  - scikit-learn=1.4
+  - scipy=1.11
+  - pyarrow=15
+  - plotly=5.22
+  - seaborn=0.13
+  - onnxruntime=1.17
+  - streamlit=1.33
+  - pip
+  - pip:
+      - torch==2.2.2
+      - transformers==4.41.2
+      - sentencepiece==0.1.99
+      - pycountry==22.3.5
+
